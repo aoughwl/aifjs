@@ -10,7 +10,7 @@ proc main =
   try:
     src = readFile(paramStr(1))
   except:
-    write stderr, "nifjs: cannot read file\n"
+    write stderr, "aifjs: cannot read file\n"
     quit 1
   setupProgramForTesting("", "cli", ".s.nif")
   var buf = parseFromBuffer(src, "cli")
