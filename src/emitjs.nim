@@ -18,6 +18,7 @@ when defined(nimony):
 import std/[strutils, sets, tables]
 import nifcursors, nifstreams, nimony_model
 import tags
+import aowlhl/hlwalk   # shared HL-IR shape decoders (local/param/proc/if/case)
 
 type
   JsEmitter = object
@@ -270,49 +271,51 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     e.emit(")")
   consumeParRi n
 
+proc emitRanges(e: var JsEmitter; rc: var Cursor) =
+  ## (ranges V0 V1 (range lo hi) …) -> a JS `||`-chain of `_s === v` / range tests.
+  ## The emitjs-specific value rendering; the branch structure is shared (hlwalk).
+  if not (rc.kind == ParLe and rc.tagEnum == RangesTagId): return
+  inc rc
+  var f2 = true
+  while rc.kind != ParRi:
+    if not f2: e.emit(" || ")
+    f2 = false
+    if rc.kind == ParLe and rc.tagEnum == RangeTagId:
+      inc rc
+      e.emit("(_s >= " & exprToStr(rc) & " && _s <= " & exprToStr(rc) & ")")
+      consumeParRi rc
+    else:
+      e.emit("(_s === " & exprToStr(rc) & ")")
+  consumeParRi rc
+
 proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool) =
   ## (case SEL (of (ranges V…) BODY) … (else BODY)). Emitted as an if-chain over
-  ## a once-bound selector; as an expression it's wrapped in an IIFE.
-  inc n
-  let sel = exprToStr(n)
+  ## a once-bound selector; as an expression it's wrapped in an IIFE. Selector +
+  ## branch structure via the shared hlwalk.decodeCase.
+  var sel = default(Cursor)
+  let branches = decodeCase(n, sel)
+  var selc = sel
+  let selStr = exprToStr(selc)
   if asExpr: e.emit("(function(_s){ ")
-  else: e.emit("{ const _s = " & sel & "; ")
-  if asExpr: e.emit("")   # selector passed as arg below
+  else: e.emit("{ const _s = " & selStr & "; ")
   var first = true
-  while n.kind != ParRi:
-    if n.kind == ParLe and n.tagEnum == OfTagId:
-      inc n
-      # (ranges V0 V1 (range lo hi) …)
+  for br in branches:
+    if br.isElse:
+      e.emit(" else { ")
+      var bc = br.body
+      if asExpr: (e.emit("return "); emitExpr(e, bc); e.emit("; }"))
+      else: (emitStmt(e, bc); e.emit(" }"))
+    else:
       e.emit(if first: "if(" else: " else if(")
       first = false
-      if n.kind == ParLe and n.tagEnum == RangesTagId:
-        inc n
-        var f2 = true
-        while n.kind != ParRi:
-          if not f2: e.emit(" || ")
-          f2 = false
-          if n.kind == ParLe and n.tagEnum == RangeTagId:
-            inc n
-            e.emit("(_s >= " & exprToStr(n) & " && _s <= " & exprToStr(n) & ")")
-            consumeParRi n
-          else:
-            e.emit("(_s === " & exprToStr(n) & ")")
-        consumeParRi n
+      var rc = br.ranges
+      emitRanges(e, rc)
       e.emit("){ ")
-      if asExpr: (e.emit("return "); emitExpr(e, n); e.emit("; }"))
-      else: (emitStmt(e, n); e.emit(" }"))
-      consumeParRi n
-    elif n.kind == ParLe and n.tagEnum == ElseTagId:
-      inc n
-      e.emit(" else { ")
-      if asExpr: (e.emit("return "); emitExpr(e, n); e.emit("; }"))
-      else: (emitStmt(e, n); e.emit(" }"))
-      consumeParRi n
-    else:
-      skip n
-  if asExpr: e.emit(" })(" & sel & ")")
+      var bc = br.body
+      if asExpr: (e.emit("return "); emitExpr(e, bc); e.emit("; }"))
+      else: (emitStmt(e, bc); e.emit(" }"))
+  if asExpr: e.emit(" })(" & selStr & ")")
   else: e.emit(" }")
-  consumeParRi n
 
 proc emitExpr(e: var JsEmitter; n: var Cursor) =
   case n.kind
@@ -498,61 +501,47 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
     inc n; e.emit("undefined")
 
 proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
-  ## (params (param :x . . TYPE .) …) -> the mangled param names.
+  ## (params (param :x . . TYPE .) …) -> the mangled param names. The grammar
+  ## navigation is the shared HL-IR skeleton (hlwalk.decodeParams); here we only
+  ## mangle to JS names and mark var/out params for boxing.
   result = @[]
-  inc n
-  while n.kind != ParRi:
-    if n.kind == ParLe and n.tagEnum == ParamTagId:
-      inc n
-      let pnm = mangle(pool.syms[n.symId])     # the param's symbol def
-      result.add pnm
-      inc n
-      skip n; skip n                           # export, pragmas
-      if n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId):
-        curBoxed.add pnm                        # var/out param -> boxed
-      while n.kind != ParRi: skip n
-      consumeParRi n
-    else:
-      skip n
-  consumeParRi n
+  for p in decodeParams(n):
+    let pnm = mangle(pool.syms[p.name])
+    result.add pnm
+    if p.byRef: curBoxed.add pnm               # var/out param -> boxed
 
 proc emitProc(e: var JsEmitter; n: var Cursor) =
-  ## (proc :name … (params …) RETTYPE … (stmts BODY))
-  inc n
-  let name = mangle(pool.syms[n.symId]); inc n
+  ## (proc :name … (params …) RETTYPE … (stmts BODY)). Shape via hlwalk.decodeProc;
+  ## params come before the body in the grammar, so collect (filling curBoxed)
+  ## then emit — a forward decl (no stmts) emits nothing, as before.
+  let sh = decodeProc(n)
+  let name = mangle(pool.syms[sh.name])
   var params: seq[string] = @[]
   let savedBoxed = curBoxed
   curBoxed = @[]
-  while n.kind != ParRi:
-    if n.kind == ParLe and n.tagEnum == ParamsTagId:
-      params = collectParams(e, n)             # also fills curBoxed
-    elif n.kind == ParLe and n.tagEnum == StmtsTagId:
-      e.emit("function " & name & "(" & joinList(params, ", ") & "){\n")
-      emitStmts(e, n)
-      e.emit("\n}\n")
-    else:
-      skip n
+  if sh.hasParams:
+    var pc = sh.params
+    params = collectParams(e, pc)              # also fills curBoxed
+  if sh.hasBody:
+    e.emit("function " & name & "(" & joinList(params, ", ") & "){\n")
+    var bc = sh.body
+    emitStmts(e, bc)
+    e.emit("\n}\n")
   curBoxed = savedBoxed
-  consumeParRi n
 
 proc emitLocal(e: var JsEmitter; n: var Cursor) =
   ## (var/let/const/result NAME EXPORT PRAGMAS TYPE VALUE) — fixed positional
   ## shape (like interp's execLocal): after the name come export, pragmas, type,
   ## then the initializer (a `.` dot if none).
-  inc n
-  let nm = mangle(pool.syms[n.symId]); inc n
-  skip n            # export marker
-  skip n            # pragmas
-  skip n            # type
+  let sh = decodeLocal(n)
+  let nm = mangle(pool.syms[sh.name])
   e.emit("let " & nm)
-  if n.kind == ParRi or n.kind == DotToken:
-    e.emit(" = 0")           # uninitialised — JS-safe default
-    if n.kind == DotToken: inc n
+  if sh.hasInit:
+    var ic = sh.init
+    e.emit(" = "); emitExpr(e, ic)
   else:
-    e.emit(" = "); emitExpr(e, n)
+    e.emit(" = 0")           # uninitialised — JS-safe default
   e.emit(";")
-  while n.kind != ParRi: skip n
-  consumeParRi n
 
 proc emitAsgn(e: var JsEmitter; n: var Cursor) =
   inc n
@@ -560,20 +549,18 @@ proc emitAsgn(e: var JsEmitter; n: var Cursor) =
   consumeParRi n
 
 proc emitIf(e: var JsEmitter; n: var Cursor) =
-  inc n
   var first = true
-  while n.kind != ParRi:
-    if n.kind == ParLe and n.tagEnum == ElifTagId:
-      inc n
+  for br in decodeIf(n):
+    if br.isElse:
+      var bc = br.body
+      e.emit(" else {\n"); emitStmt(e, bc); e.emit("\n}")
+    else:
+      var cc = br.cond
       e.emit(if first: "if(" else: " else if(")
-      emitExpr(e, n); e.emit("){\n"); emitStmt(e, n); e.emit("\n}")
-      consumeParRi n; first = false
-    elif n.kind == ParLe and n.tagEnum == ElseTagId:
-      inc n
-      e.emit(" else {\n"); emitStmt(e, n); e.emit("\n}")
-      consumeParRi n
-    else: skip n
-  consumeParRi n
+      emitExpr(e, cc); e.emit("){\n")
+      var bc = br.body
+      emitStmt(e, bc); e.emit("\n}")
+      first = false
 
 proc emitWhile(e: var JsEmitter; n: var Cursor) =
   inc n
