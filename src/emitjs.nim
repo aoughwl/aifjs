@@ -188,7 +188,9 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     skip n; e.emit("("); emitExpr(e, n); e.emit("["); emitExpr(e, n); e.emit("])")
     while n.kind != ParRi: skip n
   elif name == "add":
-    skip n; e.emit("("); emitExpr(e, n); e.emit(".push("); emitExpr(e, n); e.emit("))")
+    skip n
+    let lv = exprToStr(n)                    # target: seq push, or string reassign
+    e.emit("(" & lv & " = __append(" & lv & ", "); emitExpr(e, n); e.emit("))")
     while n.kind != ParRi: skip n
   elif name == "$":
     skip n; e.emit("String("); emitExpr(e, n); e.emit(")")
@@ -373,7 +375,13 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
       while n.kind != ParRi:
         if n.kind == ParLe and n.tagEnum == RangeTagId:
           inc n
-          e.emit("for(let _i=" & exprToStr(n) & "; _i<=" & exprToStr(n) & "; _i++) _s.add(_i); ")
+          let isChar = n.kind == CharLit                # char range -> enumerate by code
+          let lo = exprToStr(n); let hi = exprToStr(n)
+          if isChar:
+            e.emit("for(let _i=(" & lo & ").charCodeAt(0); _i<=(" & hi &
+                   ").charCodeAt(0); _i++) _s.add(String.fromCharCode(_i)); ")
+          else:
+            e.emit("for(let _i=" & lo & "; _i<=" & hi & "; _i++) _s.add(_i); ")
           consumeParRi n
         else:
           e.emit("_s.add(" & exprToStr(n) & "); ")
@@ -675,6 +683,7 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
   elif t == CaseTagId: emitCase(e, n, false)
   elif t == ForTagId: emitFor(e, n)
   elif t == BreakTagId: (e.emit("break;"); skip n)
+  elif t == ContinueTagId: (e.emit("continue;"); skip n)
   elif isCallTag(t): (emitCall(e, n); e.emit(";"))
   elif t == ProcTagId or t == FuncTagId: emitProc(e, n)
   else: skip n
@@ -752,6 +761,7 @@ proc emitModule*(root: var Cursor): string =
   e.emit("'use strict';\nlet __out='';\n")
   e.emit("function __w(x){ __out += (x===true?'true':x===false?'false':String(x)); }\n")
   e.emit("function __wf(x){ __out += (Number.isInteger(x) ? x + '.0' : String(x)); }\n")
+  e.emit("function __append(c, x){ if(typeof c === 'string') return c + x; c.push(x); return c; }\n")
   # root is the module `(stmts …)`: procs float up (JS hoists function decls),
   # top-level runs at module scope, then we return the captured output.
   emitStmt(e, root)
