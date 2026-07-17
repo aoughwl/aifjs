@@ -446,7 +446,14 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "len" and magic:
-    skip n; e.emit("("); emitExpr(e, n); e.emit(".length)")
+    # `len` yields a 64-bit int. In faithful mode that is a `bigint`, so wrap the
+    # native `.length` (a JS `number`) — otherwise `xs.len - 1` mixes bigint with
+    # number (the surrounding int64 arithmetic emits its `1` as `1n`). emitIdx
+    # coerces back with Number(), so index uses stay correct.
+    skip n
+    if faithfulMode: e.emit("BigInt(")
+    e.emit("("); emitExpr(e, n); e.emit(".length)")
+    if faithfulMode: e.emit(")")
     while n.kind != ParRi: skip n
   elif name == "[]" and magic:
     skip n                                   # callee
