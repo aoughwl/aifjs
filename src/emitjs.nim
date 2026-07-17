@@ -822,8 +822,13 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       inc n; emitExpr(e, n, wantBig)            # (expr VALUE) -> VALUE
       while n.kind != ParRi: skip n
       consumeParRi n
-    elif t == OconstrTagId:
-      inc n; skip n                             # (oconstr TYPE (kv f v) …) -> {f:v,…}
+    elif t == OconstrTagId or t == NewobjTagId:
+      # (oconstr TYPE (kv f v) …) — a plain object literal {f:v,…}. A `ref object`
+      # sem's as (newobj TYPE (kv f v) …): under JS's GC the ref is just the object
+      # reference, so it lowers to the identical literal. Inherited base fields are
+      # already flattened into the kv list by sem. Omitted ref fields default to a
+      # nil-conv (-> null), so every field carries its zero value.
+      inc n; skip n                             # TYPE
       e.emit("({")
       var first = true
       while n.kind != ParRi:
@@ -833,12 +838,14 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
           inc n
           e.emit(mangle(pool.syms[n.symId]) & ": "); inc n
           emitExpr(e, n)
-          while n.kind != ParRi: skip n
+          while n.kind != ParRi: skip n         # trailing inheritance-depth marker
           consumeParRi n
         else: skip n
       e.emit("})"); consumeParRi n
-    elif t == DotTagId:
-      inc n; emitExpr(e, n)                     # (dot OBJ FIELD idx "name")
+    elif t == DotTagId or t == DdotTagId:
+      # (dot OBJ FIELD idx "name"); ddot is the ref-object deref-dot — the deref is
+      # implicit in JS (objects are references), so both are just `OBJ.field`.
+      inc n; emitExpr(e, n)
       e.emit("." & mangle(pool.syms[n.symId])); inc n
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -909,7 +916,15 @@ proc emitProc(e: var JsEmitter; n: var Cursor) =
   ## params come before the body in the grammar, so collect (filling curBoxed)
   ## then emit — a forward decl (no stmts) emits nothing, as before.
   let sh = decodeProc(n)
-  let name = mangle(pool.syms[sh.name])
+  let rawName = pool.syms[sh.name]
+  # ARC/RTTI hook instances (`=destroy`/`=wasmoved`/`=dup`/`=copy`/`=sinkh`/`=trace`)
+  # are compiler-generated memory-management machinery, all named with a leading `=`.
+  # JS is garbage-collected, so they're dead weight — drop them (decodeProc already
+  # consumed the node). `=destroy` on an inheriting type sems as a `method`, which
+  # emitStmt skips already; this catches the plain-proc hooks. User procs never begin
+  # with `=`, so nothing user-defined is dropped.
+  if rawName.len > 0 and rawName[0] == '=': return
+  let name = mangle(rawName)
   var params: seq[string] = @[]
   let savedBoxed = curBoxed
   curBoxed = @[]
