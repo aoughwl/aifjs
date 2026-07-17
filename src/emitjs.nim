@@ -80,9 +80,31 @@ proc bigContains(nm: string): bool =
 proc bigAdd(nm: string) =
   if not bigContains(nm): bigVars.add nm
 
+## nimony `char` and `string`/`cstring` both map to a JS `string`, so the emitter
+## can't tell them apart from the type node alone in every context. We track which
+## locals/params are `char` vs `string` so a `char -> int` conversion emits
+## `.charCodeAt(0)` (a JS one-char string has no numeric value) instead of a bogus
+## `Number("A")`/`BigInt("A")`.
+var charVars: seq[string] = @[]
+var strVars: seq[string] = @[]
+proc listHas(xs: seq[string]; nm: string): bool =
+  for x in xs:
+    if x == nm: return true
+  return false
+proc charAdd(nm: string) =
+  if not listHas(charVars, nm): charVars.add nm
+proc strAdd(nm: string) =
+  if not listHas(strVars, nm): strVars.add nm
+
 ## true iff the proc currently being emitted returns a 64-bit int (faithful mode);
 ## a bare-literal `return` in such a proc must emit bigint.
 var curRetBig: bool = false
+
+## names (mangled) of the current proc's plain (non-boxed) bigint value params
+## (faithful mode). Coerced to bigint at function entry so an untyped literal
+## argument (`bump(5)` — nimony passes a bare `5`, not `5n`) can't leak a `number`
+## into the body's bigint arithmetic and trigger a JS mix-BigInt-and-number error.
+var curBigParams: seq[string] = @[]
 
 ## a nimony symbol -> a stable, valid JS identifier.
 proc mangle(name: string): string =
@@ -98,6 +120,53 @@ proc opName(name: string): string =
     if name[i] == '.' and name[i+1] in {'0'..'9'}: return name[0 ..< i]
     inc i
   result = name.strip(leading = false, chars = {'.'})
+
+## classify a type node (unwrapping mut/out/sink/lent/rangetype) as char / string.
+## 1 = char, 2 = string/cstring, 0 = neither.
+proc typeNamed(c: Cursor): int =
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
+        n.tagEnum == SinkTagId or n.tagEnum == LentTagId or n.tagEnum == RangetypeTagId):
+    inc n
+  case n.kind
+  of Symbol, SymbolDef, Ident:
+    let nm = opName(pool.syms[n.symId])
+    if nm == "char": return 1
+    elif nm == "string" or nm == "cstring": return 2
+    else: return 0
+  of ParLe:
+    let t = n.tagEnum
+    if t == CTagId: return 1
+    elif t == StringTagId or t == CstringTagId: return 2
+    else: return 0
+  else: return 0
+
+## true iff the conversion source `n` yields a JS `string` that models a nimony
+## `char` — a char var/param, a `CharLit`, an index into a `string`, or a nested
+## char-producing conv. Such a source needs `.charCodeAt(0)` to become an int.
+proc sourceIsChar(n: Cursor): bool =
+  case n.kind
+  of CharLit: return true
+  of Symbol, SymbolDef, Ident: return listHas(charVars, mangle(pool.syms[n.symId]))
+  of ParLe:
+    let t = n.tagEnum
+    if t == AtTagId or t == ArratTagId:
+      var d = n; inc d
+      if d.kind == Symbol or d.kind == SymbolDef or d.kind == Ident:
+        return listHas(strVars, mangle(pool.syms[d.symId]))
+      return false
+    elif t == CallTagId or t == HcallTagId or t == CmdTagId:
+      var d = n; inc d                        # callee
+      if (d.kind == Symbol or d.kind == SymbolDef) and opName(pool.syms[d.symId]) == "[]":
+        inc d                                 # container arg
+        if d.kind == Symbol or d.kind == SymbolDef or d.kind == Ident:
+          return listHas(strVars, mangle(pool.syms[d.symId]))
+      return false
+    elif t == ConvTagId or t == HconvTagId:
+      var d = n; inc d
+      return d.kind == ParLe and d.tagEnum == CTagId
+    else: return false
+  else: return false
 
 proc jsString(s: string): string =
   result = "\""
@@ -501,6 +570,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
         # narrower/number/float source -> bigint: BigInt() then width-wrap.
         let w = if targetK == 1: "_i64" else: "_u64"
         if n.kind == CharLit: (e.emit(w & "(BigInt(" & $int(n.charLit) & "))"); inc n)
+        elif sourceIsChar(n): (e.emit(w & "(BigInt("); emitExpr(e, n); e.emit(".charCodeAt(0)))"))
         elif looksFloat(n): (e.emit(w & "(BigInt(Math.trunc("); emitExpr(e, n); e.emit(")))"))
         else: (e.emit(w & "(BigInt("); emitExpr(e, n); e.emit("))"))
       elif faithfulMode and producesBig(n):
@@ -508,6 +578,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
         e.emit("Number("); emitExpr(e, n, true); e.emit(")")
       else:
         if toInt and n.kind == CharLit: (e.emit($int(n.charLit)); inc n)   # ord('A') -> 65
+        elif toInt and sourceIsChar(n): (e.emit("("); emitExpr(e, n); e.emit(").charCodeAt(0)"))
         else: emitExpr(e, n)
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -665,7 +736,14 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       var byRef = false
       if n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId):
         byRef = true               # var/out param -> boxed
-      if faithfulMode and not byRef and int64Kind(n) > 0: bigAdd pnm
+      let typeCur = n
+      if faithfulMode and not byRef and int64Kind(n) > 0:
+        bigAdd pnm
+        curBigParams.add pnm
+      case typeNamed(typeCur)
+      of 1: charAdd pnm
+      of 2: strAdd pnm
+      else: discard
       skip n                       # type
       while n.kind != ParRi: skip n
       consumeParRi n
@@ -684,6 +762,8 @@ proc emitProc(e: var JsEmitter; n: var Cursor) =
   var params: seq[string] = @[]
   let savedBoxed = curBoxed
   curBoxed = @[]
+  let savedBigParams = curBigParams
+  curBigParams = @[]
   if sh.hasParams:
     var pc = sh.params
     params = collectParams(e, pc)              # also fills curBoxed
@@ -697,11 +777,16 @@ proc emitProc(e: var JsEmitter; n: var Cursor) =
       if int64Kind(rc) > 0: curRetBig = true
   if sh.hasBody:
     e.emit("function " & name & "(" & joinList(params, ", ") & "){\n")
+    # coerce plain bigint params so an untyped-literal argument (a bare `number`)
+    # can't mix with bigint arithmetic inside the body. BigInt() is a no-op on an
+    # existing bigint, so typed callers are unaffected.
+    for bp in curBigParams: e.emit("  " & bp & " = BigInt(" & bp & ");\n")
     var bc = sh.body
     emitStmts(e, bc)
     e.emit("\n}\n")
   curRetBig = savedRetBig
   curBoxed = savedBoxed
+  curBigParams = savedBigParams
 
 proc emitLocal(e: var JsEmitter; n: var Cursor) =
   ## (var/let/const/result NAME EXPORT PRAGMAS TYPE VALUE) — fixed positional
@@ -711,6 +796,14 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
   let nm = mangle(pool.syms[sh.name])
   let big = faithfulMode and int64Kind(sh.typ) > 0
   if big: bigAdd nm
+  let tn = typeNamed(sh.typ)                  # distinguish char (charCodeAt) from string
+  if tn == 1: charAdd nm
+  elif tn == 2:
+    var isCh = false
+    if sh.hasInit:
+      var ic = sh.init
+      if ic.kind == CharLit: isCh = true
+    if isCh: charAdd nm else: strAdd nm
   e.emit("let " & nm)
   if sh.hasInit:
     var ic = sh.init
