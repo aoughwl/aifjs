@@ -15,7 +15,7 @@ AIFJS="$ROOT/bin/aifjs"
 SRC="$HERE/faithful"
 NC="/tmp/aifjs-faithful-nc"
 OUT="$HERE/_out_faithful"
-mkdir -p "$NC" "$OUT"
+rm -rf "$NC"; mkdir -p "$NC" "$OUT"
 
 NODE_BIN="$(command -v node || true)"
 pass=0; fail=0; total=0
@@ -23,8 +23,17 @@ pass=0; fail=0; total=0
 for f in "$SRC"/*.nim; do
   name="$(basename "$f" .nim)"
   total=$((total+1))
-  ref="$("$NIM/bin/nimony" c -r --nimcache:"$NC" -f "$f" 2>"$OUT/$name.build.log")"
-  snif="$(grep -l "$name.nim" "$NC"/*.s.nif 2>/dev/null | head -1)"
+  # per-test cache (no stale-.s.nif flake) + retry the transient static.o link race.
+  # Retry the transient shared-static.o link race: it can leave a valid .s.nif but
+  # an EMPTY reference stdout (compile ok, run-link failed). Every test here echoes
+  # output, so an empty ref means the race hit — retry with a fresh cache.
+  nc="$NC/$name"
+  for try in 1 2 3 4 5; do
+    rm -rf "$nc"; mkdir -p "$nc"
+    ref="$("$NIM/bin/nimony" c -r --nimcache:"$nc" -f "$f" 2>"$OUT/$name.build.log")"
+    snif="$(grep -l "$name.nim" "$nc"/*.s.nif 2>/dev/null | head -1)"
+    [ -n "$snif" ] && [ -n "$ref" ] && break
+  done
   if [ -z "$snif" ]; then
     echo "FAIL  $name  (no .s.nif — see $OUT/$name.build.log)"
     fail=$((fail+1)); continue
