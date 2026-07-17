@@ -230,6 +230,7 @@ proc exprToStr(n: var Cursor; wantBig = false): string
 proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool)
 proc emitBoxArg(e: var JsEmitter; n: var Cursor)
 proc emitArrow(e: var JsEmitter; n: var Cursor)
+proc collExpr(n: var Cursor): string
 
 ## the JS operator for a binary-arithmetic/comparison tag, or "" if not one.
 proc binOp(t: TagEnum): string =
@@ -527,6 +528,19 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     while n.kind != ParRi: skip n
   elif name == "ord" and magic:
     skip n; e.emit("("); emitExpr(e, n); e.emit(").charCodeAt(0)")
+    while n.kind != ParRi: skip n
+  elif (name == "filter" or name == "map") and magic:
+    # std/sequtils higher-order funcs -> native JS Array.filter/.map. Shape:
+    # (call filter/map INSTANCE (hcall toOpenArray SEQ) CLOSURE). The collection is
+    # wrapped in toOpenArray/items — collExpr unwraps it back to the seq; the closure
+    # is emitted as a JS arrow (via the (expr (stmts (proc …) ref)) path). Native
+    # .filter/.map ignore the extra (index, array) callback args, so fixed-arity
+    # arrows are safe.
+    skip n                                   # callee
+    let coll = collExpr(n)                    # unwrap toOpenArray -> the seq
+    e.emit("(" & coll & "." & name & "(")
+    emitExpr(e, n)                            # the predicate/transform closure
+    e.emit("))")
     while n.kind != ParRi: skip n
   elif name == "abs" and magic:
     skip n; e.emit("Math.abs("); emitExpr(e, n); e.emit(")")
